@@ -1,7 +1,13 @@
-/* シンプルシェルの実装
- * 複数パイプ + リダイレクション + 連続リダイレクション + >> + &
- * バックグラウンド回収 + cd / pwd / exit
- */
+/* =========================================================
+ * シンプルシェルの実装
+ * 
+ * 機能：
+ *  - 複数パイプ (|)
+ *  - リダイレクション (<, >, >>)
+ *  - バックグラウンド実行 (&)
+ *  - バックグラウンドプロセス回収
+ *  - 組み込みコマンド (cd, pwd, exit)
+ * ========================================================= */
 
 #include <stdio.h>
 #include <string.h>
@@ -12,74 +18,85 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+/* 標準入出力のファイルディスクリプタ */
 #define STDIN 0
 #define STDOUT 1
 #define STDERR 2
 
+/* 最大引数数と最大コマンド数 */
 #define MAX_ARGS 256
 #define MAX_CMDS 32
 
+/* プロセス実行モード */
 enum proc_flag {
-  FORE,
-  BACK
+  FORE,  // フォアグラウンド
+  BACK   // バックグラウンド
 };
 
+/* 関数プロトタイプ */
 char **separate(char *, int, int *);
 void sigint_handler(int);
 void reap_background(void);
 int exec_builtin(char **argv);
 void apply_redirection(char **argv);
 
+/* =========================================================
+ * main関数
+ * ========================================================= */
 int main(void)
 {
-  char prompt[64] = "> ";
-  char command[256];
-  char *cmd;
-  char **argments;
-  int amount;
-  enum proc_flag flag;
+  char prompt[64] = "> ";   // プロンプト表示
+  char command[256];        // 入力コマンド
+  char **argments;          // 引数配列
+  int amount;               // 引数数
+  enum proc_flag flag;      // 実行モード
 
+  /* Ctrl+Cハンドラ設定 */
   signal(SIGINT, sigint_handler);
 
   while (1) {
-    char **cmdv[MAX_CMDS];
-    int cmd_count = 0;
+
+    char **cmdv[MAX_CMDS];  // 各コマンドの先頭ポインタ
+    int cmd_count = 0;      // コマンド数
     int i, j;
 
+    /* 終了したバックグラウンドプロセスを回収 */
     reap_background();
 
     fprintf(stderr, "%s", prompt);
 
+    /* 入力取得 */
     if (fgets(command, sizeof(command), stdin) == NULL) {
       break;
     }
 
-    {
-      size_t len = strlen(command);
-      if (len > 0 && command[len - 1] == '\n') {
-        command[len - 1] = '\0';
-      }
+    /* 改行削除 */
+    size_t len = strlen(command);
+    if (len > 0 && command[len - 1] == '\n') {
+      command[len - 1] = '\0';
     }
 
-    cmd = command;
+    /* 空白で分割 */
+    argments = separate(command, MAX_ARGS, &amount);
+    if (argments == NULL) continue;
 
-    argments = separate(cmd, MAX_ARGS, &amount);
-    if (argments == NULL) {
-      continue;
-    }
-
+    /* 空入力ならスキップ */
     if (amount == 0) {
       free(argments);
       continue;
     }
 
-    if (strcmp(argments[0], "exit") == 0 || strcmp(argments[0], "quit") == 0) {
+    /* exit / quit で終了 */
+    if (strcmp(argments[0], "exit") == 0 ||
+        strcmp(argments[0], "quit") == 0) {
       free(argments);
       break;
     }
 
+    /* デフォルトはフォアグラウンド */
     flag = FORE;
 
+    /* "&" があればバックグラウンド */
     if (amount > 0 && strcmp(argments[amount - 1], "&") == 0) {
       flag = BACK;
       argments[amount - 1] = NULL;
@@ -91,12 +108,16 @@ int main(void)
       continue;
     }
 
+    /* 最初のコマンド登録 */
     cmdv[cmd_count++] = &argments[0];
 
+    /* "|" で分割して複数コマンドに */
     for (i = 0; i < amount; i++) {
-      if (argments[i] != NULL && strcmp(argments[i], "|") == 0) {
+      if (argments[i] && strcmp(argments[i], "|") == 0) {
+
         argments[i] = NULL;
 
+        /* 構文チェック */
         if (i + 1 >= amount || argments[i + 1] == NULL) {
           fprintf(stderr, "pipe syntax error\n");
           cmd_count = -1;
@@ -118,6 +139,7 @@ int main(void)
       continue;
     }
 
+    /* 空コマンドチェック */
     for (i = 0; i < cmd_count; i++) {
       if (cmdv[i][0] == NULL) {
         fprintf(stderr, "empty command error\n");
@@ -131,6 +153,9 @@ int main(void)
       continue;
     }
 
+    /* =====================
+     * 組み込みコマンド処理
+     * ===================== */
     if (cmd_count == 1 && flag == FORE) {
       if (exec_builtin(cmdv[0]) == 0) {
         free(argments);
@@ -138,80 +163,87 @@ int main(void)
       }
     }
 
-    {
-      int prev_read = -1;
-      pid_t pids[MAX_CMDS];
+    /* =====================
+     * パイプ実行
+     * ===================== */
 
-      for (i = 0; i < cmd_count; i++) {
-        int fd[2] = { -1, -1 };
-        pid_t pid;
+    int prev_read = -1;      // 前のパイプの読み取り側
+    pid_t pids[MAX_CMDS];
 
-        if (i < cmd_count - 1) {
-          if (pipe(fd) < 0) {
-            perror("pipe");
-            break;
-          }
-        }
+    for (i = 0; i < cmd_count; i++) {
 
-        pid = fork();
+      int fd[2] = { -1, -1 };
 
-        if (pid == 0) {
-          signal(SIGINT, SIG_DFL);
-
-          if (prev_read >= 0) {
-            dup2(prev_read, STDIN);
-            close(prev_read);
-          }
-
-          if (i < cmd_count - 1) {
-            close(fd[0]);
-            dup2(fd[1], STDOUT);
-            close(fd[1]);
-          }
-
-          apply_redirection(cmdv[i]);
-
-          if (exec_builtin(cmdv[i]) == 0) {
-            exit(0);
-          }
-
-          if (execvp(cmdv[i][0], cmdv[i]) == -1) {
-            perror("execvp");
-            exit(1);
-          }
-        }
-        else if (pid > 0) {
-          pids[i] = pid;
-
-          if (prev_read >= 0) {
-            close(prev_read);
-          }
-
-          if (i < cmd_count - 1) {
-            close(fd[1]);
-            prev_read = fd[0];
-          }
-          else {
-            prev_read = -1;
-          }
-        }
-        else {
-          perror("fork");
-          if (prev_read >= 0) close(prev_read);
-          if (fd[0] >= 0) close(fd[0]);
-          if (fd[1] >= 0) close(fd[1]);
+      /* 次のパイプ作成 */
+      if (i < cmd_count - 1) {
+        if (pipe(fd) < 0) {
+          perror("pipe");
           break;
         }
       }
 
-      if (flag == BACK) {
-        printf("[background]\n");
-      }
-      else {
-        int st;
-        for (j = 0; j < cmd_count; j++) {
-          waitpid(pids[j], &st, 0);
+      pid_t pid = fork();
+
+      /* ========= 子プロセス ========= */
+      if (pid == 0) {
+
+        /* Ctrl+Cは子だけ効くように */
+        signal(SIGINT, SIG_DFL);
+
+        /* 前のパイプ入力 */
+        if (prev_read >= 0) {
+          dup2(prev_read, STDIN);
+          close(prev_read);
         }
+
+        /* 次のパイプ出力 */
+        if (i < cmd_count - 1) {
+          close(fd[0]);
+          dup2(fd[1], STDOUT);
+          close(fd[1]);
+        }
+
+        /* リダイレクション処理 */
+        apply_redirection(cmdv[i]);
+
+        /* built-in（子で実行するケース） */
+        if (exec_builtin(cmdv[i]) == 0) {
+          exit(0);
+        }
+
+        /* 外部コマンド実行 */
+        if (execvp(cmdv[i][0], cmdv[i]) == -1) {
+          perror("execvp");
+          exit(1);
+        }
+      }
+
+      /* ========= 親プロセス ========= */
+      else if (pid > 0) {
+        pids[i] = pid;
+
+        if (prev_read >= 0) close(prev_read);
+
+        if (i < cmd_count - 1) {
+          close(fd[1]);
+          prev_read = fd[0];
+        } else {
+          prev_read = -1;
+        }
+      }
+
+      else {
+        perror("fork");
+        break;
+      }
+    }
+
+    /* フォアグラウンドなら待機 */
+    if (flag == BACK) {
+      printf("[background]\n");
+    } else {
+      for (j = 0; j < cmd_count; j++) {
+        waitpid(pids[j], NULL, 0);
       }
     }
 
@@ -221,37 +253,21 @@ int main(void)
   return 0;
 }
 
+/* =========================================================
+ * 文字列を空白で分割
+ * ========================================================= */
 char **separate(char *buf, int max, int *count)
 {
   char **chops = malloc((max + 1) * sizeof(char *));
   int i;
 
-  if (chops == NULL) {
-    perror("malloc");
-    return NULL;
-  }
+  if (!chops) return NULL;
 
   for (i = 0; i < max; i++) {
-    char *tok;
-
-    if (i == 0) {
-      tok = strtok(buf, " \t");
-    }
-    else {
-      tok = strtok(NULL, " \t");
-    }
-
-    if (tok == NULL) {
-      break;
-    }
-
+    char *tok = (i == 0) ? strtok(buf, " \t")
+                        : strtok(NULL, " \t");
+    if (!tok) break;
     chops[i] = tok;
-  }
-
-  if (i >= max) {
-    printf("Too many args\n");
-    free(chops);
-    return NULL;
   }
 
   chops[i] = NULL;
@@ -260,77 +276,46 @@ char **separate(char *buf, int max, int *count)
   return chops;
 }
 
+/* =========================================================
+ * リダイレクション処理
+ * ========================================================= */
 void apply_redirection(char **argv)
 {
-  int k;
+  for (int k = 0; argv[k]; k++) {
 
-  for (k = 0; argv[k] != NULL; k++) {
-    if (strcmp(argv[k], "<") == 0) {
-      int in_fd;
-
-      if (argv[k + 1] == NULL) {
-        fprintf(stderr, "input redirection error\n");
-        exit(1);
-      }
-
-      in_fd = open(argv[k + 1], O_RDONLY);
-      if (in_fd < 0) {
-        perror("open");
-        exit(1);
-      }
-
-      dup2(in_fd, STDIN);
-      close(in_fd);
-
+    /* 入力リダイレクト */
+    if (!strcmp(argv[k], "<")) {
+      int fd = open(argv[k + 1], O_RDONLY);
+      dup2(fd, STDIN);
+      close(fd);
       argv[k] = NULL;
     }
-    else if (strcmp(argv[k], ">") == 0) {
-      int out_fd;
 
-      if (argv[k + 1] == NULL) {
-        fprintf(stderr, "output redirection error\n");
-        exit(1);
-      }
-
-      out_fd = open(argv[k + 1],
+    /* 出力リダイレクト */
+    else if (!strcmp(argv[k], ">")) {
+      int fd = open(argv[k + 1],
                     O_WRONLY | O_CREAT | O_TRUNC,
-                    S_IRUSR | S_IWUSR);
-
-      if (out_fd < 0) {
-        perror("open");
-        exit(1);
-      }
-
-      dup2(out_fd, STDOUT);
-      close(out_fd);
-
+                    0644);
+      dup2(fd, STDOUT);
+      close(fd);
       argv[k] = NULL;
     }
-    else if (strcmp(argv[k], ">>") == 0) {
-      int out_fd;
 
-      if (argv[k + 1] == NULL) {
-        fprintf(stderr, "append redirection error\n");
-        exit(1);
-      }
-
-      out_fd = open(argv[k + 1],
+    /* 追記 */
+    else if (!strcmp(argv[k], ">>")) {
+      int fd = open(argv[k + 1],
                     O_WRONLY | O_CREAT | O_APPEND,
-                    S_IRUSR | S_IWUSR);
-
-      if (out_fd < 0) {
-        perror("open");
-        exit(1);
-      }
-
-      dup2(out_fd, STDOUT);
-      close(out_fd);
-
+                    0644);
+      dup2(fd, STDOUT);
+      close(fd);
       argv[k] = NULL;
     }
   }
 }
 
+/* =========================================================
+ * バックグラウンド回収
+ * ========================================================= */
 void reap_background(void)
 {
   int st;
@@ -342,49 +327,35 @@ void reap_background(void)
   }
 }
 
+/* =========================================================
+ * Ctrl+C処理
+ * ========================================================= */
 void sigint_handler(int x)
 {
   (void)x;
   write(STDERR, "\n", 1);
 }
 
+/* =========================================================
+ * 組み込みコマンド
+ * ========================================================= */
 int exec_builtin(char **argv)
 {
   char cwd[1024];
 
-  if (argv[0] == NULL) {
-    return -1;
-  }
+  if (!argv[0]) return -1;
 
-  if (strcmp(argv[0], "cd") == 0) {
-    if (argv[1] == NULL) {
-      char *home = getenv("HOME");
-      if (home == NULL) {
-        fprintf(stderr, "cd: HOME not set\n");
-        return 0;
-      }
-
-      if (chdir(home) < 0) {
-        perror("cd");
-      }
-    }
-    else {
-      if (chdir(argv[1]) < 0) {
-        perror("cd");
-      }
-    }
-
+  /* cd */
+  if (!strcmp(argv[0], "cd")) {
+    if (!argv[1]) chdir(getenv("HOME"));
+    else chdir(argv[1]);
     return 0;
   }
 
-  if (strcmp(argv[0], "pwd") == 0) {
-    if (getcwd(cwd, sizeof(cwd)) == NULL) {
-      perror("pwd");
-    }
-    else {
-      printf("%s\n", cwd);
-    }
-
+  /* pwd */
+  if (!strcmp(argv[0], "pwd")) {
+    getcwd(cwd, sizeof(cwd));
+    printf("%s\n", cwd);
     return 0;
   }
 
