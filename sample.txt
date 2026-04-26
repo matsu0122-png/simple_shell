@@ -1,5 +1,0 @@
-> ls
-> ls | wc -l
-> echo hello > a.txt
-> cat a.txt
-> sleep 5 &
